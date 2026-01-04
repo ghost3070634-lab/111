@@ -6,12 +6,11 @@ import time
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. 核心配置區 (請務必填寫你的 URL)
+# 1. 核心配置區
 # ==========================================
-# 已填入你提供的 Webhook URL
 DISCORD_URL = "https://discord.com/api/webhooks/1457246379242950797/LB6npSWu5J9ZbB8NYp90N-gpmDrjOK2qPqtkaB5AP6YztzdfzmBF6oxesKJybWQ04xoU"
-COOL_DOWN_HOURS = 4  # 訊號冷卻時間：同幣種同方向 4 小時內不重複發報
-
+# 已改為 0.25 小時 (即 15 分鐘)
+COOL_DOWN_HOURS = 0.25
 # ==========================================
 # 2. 策略計算函式 (對應 TheConcept 指標)
 # ==========================================
