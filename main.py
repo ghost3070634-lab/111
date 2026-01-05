@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 # 1. 配置設定
 # ==========================================
 # 優先讀取 Zeabur 環境變數，如果沒有則使用預設值
-DISCORD_URL = os.getenv("https://discord.com/api/webhooks/1457246379242950797/LB6npSWu5J9ZbB8NYp90N-gpmDrjOK2qPqtkaB5AP6YztzdfzmBF6oxesKJybWQ04xoU", "你的_DISCORD_WEBHOOK_URL_填在這裡")
+DISCORD_URL = os.getenv("https://discord.com/api/webhooks/1457246379242950797/LB6npSWu5J9ZbB8NYp90N-gpmDrjOK2qPqtkaB5AP6YztzdfzmBF6oxesKJybWQ04xoU")
 
 # 交易所設定 (不需 API Key，只需讀取公開數據)
 exchange = ccxt.bybit({
@@ -240,48 +240,39 @@ def process_data(df):
 # ==========================================
 class TradingBot:
     def __init__(self):
-        # 記錄每個幣種+週期的最後訊號時間 (timestamp)
         self.last_signals = {} 
         self.symbols = []
         self.last_update = datetime.min
 
     def update_top_symbols(self):
-        """獲取熱門幣種"""
         if datetime.now() - self.last_update > timedelta(hours=4):
             try:
                 tickers = exchange.fetch_tickers()
                 valid_tickers = []
-                exclude = ['USDC', 'DAI', 'FDUSD', 'USDE', 'BUSD']
+                # 嚴格排除穩定幣
+                exclude = ['USDC', 'DAI', 'FDUSD', 'USDE', 'BUSD', 'TUSD', 'PYUSD', 'USDD']
                 for s, t in tickers.items():
-                    if '/USDT' in s and not any(ex in s for ex in exclude):
-                        vol = t['quoteVolume'] if t.get('quoteVolume') else 0
-                        valid_tickers.append({'symbol': s, 'vol': vol})
-                
-                # 取成交量前 10
-                self.symbols = [x['symbol'] for x in sorted(valid_tickers, key=lambda x: x['vol'], reverse=True)[:10]]
+                    if '/USDT' in s:
+                        # 檢查 symbol 名稱中是否包含排除的關鍵字
+                        is_stable = any(ex in s for ex in exclude)
+                        if not is_stable:
+                            vol = t['quoteVolume'] if t.get('quoteVolume') else 0
+                            valid_tickers.append({'symbol': s, 'vol': vol})
+                            
+                self.symbols = [x['symbol'] for x in sorted(valid_tickers, key=lambda x: x['vol'], reverse=True)[:15]]
                 self.last_update = datetime.now()
-                print(f"[{datetime.now().strftime('%H:%M')}] 更新監控清單: {self.symbols}")
-            except Exception as e:
-                print(f"更新清單失敗: {e}")
-                if not self.symbols: self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+                print(f"[{datetime.now().strftime('%H:%M')}] 更新監控: {self.symbols}")
+            except: self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
         return self.symbols
 
     def calculate_sl_tp(self, df, side):
-        """計算止盈止損 (依照 Pine Script RMA 邏輯)"""
         curr = df.iloc[-1]
-        
-        # Pine: ma_function(ta.tr(true), length) * m1
-        # Python pandas_ta 的 rma 預設即為 Pine 的 rma
         rma_tr = ta.rma(df['tr'], length=14).iloc[-1]
-        
-        m_tp1 = 2.55
-        m_tp2 = 5.1
-        m_tp3 = 7.65
-        
+        m_tp1, m_tp2, m_tp3 = 2.55, 5.1, 7.65
         entry = curr['close']
         
         if side == "LONG":
-            sl = curr['low'] - (rma_tr * m_tp1) # Pine 中 SL 參考的是 x2 (用 m 計算的距離)
+            sl = curr['low'] - (rma_tr * m_tp1)
             tp1 = curr['high'] + (rma_tr * m_tp1)
             tp2 = curr['high'] + (rma_tr * m_tp2)
             tp3 = curr['high'] + (rma_tr * m_tp3)
@@ -290,63 +281,52 @@ class TradingBot:
             tp1 = curr['low'] - (rma_tr * m_tp1)
             tp2 = curr['low'] - (rma_tr * m_tp2)
             tp3 = curr['low'] - (rma_tr * m_tp3)
-            
         return entry, sl, tp1, tp2, tp3
 
     def run_analysis(self):
         symbols = self.update_top_symbols()
-        timeframes = ['15m', '30m', '1h'] # 需要監控的週期
+        timeframes = ['15m', '30m', '1h']
         
         for symbol in symbols:
             for tf in timeframes:
                 try:
-                    # 直接獲取該週期的數據 (更精準，不使用 resample)
-                    limit = 500 # 足夠計算 EMA200
-                    bars = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+                    bars = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=500)
                     df = pd.DataFrame(bars, columns=['timestamp','open','high','low','close','volume'])
                     df = df.astype(float)
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     
                     side, df_result = process_data(df)
                     
                     if side:
-                        # 檢查冷卻時間 (Pine: bar_index - last_signal_bar > 6)
-                        # 這裡我們用時間判斷，簡單起見設為該週期的 6 倍時間
                         signal_key = f"{symbol}_{tf}_{side}"
-                        last_time = self.last_signals.get(signal_key, 0)
-                        
-                        # 轉換當前K線時間戳
+                        last_ts = self.last_signals.get(signal_key, 0)
                         current_ts = df['timestamp'].iloc[-1]
                         
-                        # 如果是新訊號 (時間戳不同 且 距離上次足夠久)
-                        # 這裡簡化邏輯：只要這根K線還沒發過通知就可以
-                        # 若要嚴格模擬 bar_index > 6，則比較複雜，這邊採用「不重複通知同一根K線」
-                        if current_ts != last_time:
+                        if current_ts != last_ts:
                             entry, sl, tp1, tp2, tp3 = self.calculate_sl_tp(df_result, side)
                             self.send_discord(symbol, side, tf, entry, sl, tp1, tp2, tp3)
-                            self.last_signals[signal_key] = current_ts # 更新最後發訊號的K線時間
-                            
-                    time.sleep(0.2) # 避免 API Rate Limit
-                    
+                            self.last_signals[signal_key] = current_ts
+                    time.sleep(0.1)
                 except Exception as e:
-                    print(f"分析錯誤 {symbol} {tf}: {e}")
+                    print(f"Error {symbol}: {e}")
 
-  # ==========================================
-    # 4. 修改後的通知格式 (符合圖片)
+    # ==========================================
+    # 4. 修改後的通知格式 (嚴格對齊圖片)
     # ==========================================
     def send_discord(self, symbol, side, interval, entry, sl, tp1, tp2, tp3):
-        # 取得台灣時間
+        # 強制加 8 小時 (解決 Zeabur 時區問題)
         tw_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%H:%M')
         
-        # 處理方向文字
+        # 中文方向
         side_cn = "做多" if side == "LONG" else "做空"
         
-        # 處理標題顯示 (如果你想顯示 COINGLASS 可以在這裡改)
-        exchange_name = "BYBIT" # 或是寫 "BIGGET", "COINGLASS"
+        # 顯示名稱
+        exchange_name = "BYBIT" # 這裡可以改成 BIGGET 或 COINGLASS
         
-        # 格式化數字 (保留4位小數，若數字過小可動態調整)
+        # 格式化數字 (保留4位小數，去除尾端多餘0)
         def fmt(num): return f"{num:.4f}".rstrip('0').rstrip('.')
         
-        # 組合純文字訊息
+        # 這裡的排版完全按照你的要求
         msg = (
             f"🚨\n"
             f"{symbol} 訊號 {exchange_name}\n"
@@ -370,9 +350,10 @@ class TradingBot:
 
 if __name__ == "__main__":
     bot = TradingBot()
-    print("🚀 Zeabur Trading Bot (格式修正版) 已啟動...")
-    # 測試發送一則訊息確認格式
-    bot.send_discord("TEST/USDT", "LONG", "15m", 100.5, 99.0, 102.0, 104.0, 106.0)
+    print("🚀 Zeabur Trading Bot (格式嚴格修正版) 已啟動...")
+    
+    # 測試訊號 (格式檢查用)
+    bot.send_discord("TEST/USDT", "SHORT", "30m", 0.0282, 0.0292, 0.0267, 0.0250, 0.0230)
     
     while True:
         bot.run_analysis()
