@@ -4,78 +4,160 @@ import pandas_ta as ta
 import numpy as np
 import time
 import requests
+import os
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. 核心配置區
+# 1. 配置設定
 # ==========================================
-DISCORD_URL = "YOUR_WEBHOOK_URL" # 請填入你的 Webhook
-COOL_DOWN_HOURS = 0.25 
+# 優先讀取 Zeabur 環境變數，如果沒有則使用預設值
+DISCORD_URL = os.getenv("https://discord.com/api/webhooks/1457246379242950797/LB6npSWu5J9ZbB8NYp90N-gpmDrjOK2qPqtkaB5AP6YztzdfzmBF6oxesKJybWQ04xoU", "你的_DISCORD_WEBHOOK_URL_填在這裡")
 
-EXCHANGE = ccxt.bybit({
+# 交易所設定 (不需 API Key，只需讀取公開數據)
+exchange = ccxt.bybit({
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'} 
+    'options': {'defaultType': 'spot'}
 })
 
+# 策略參數
+VIDYA_LEN = 10
+VIDYA_MOM = 20
+CCI_LEN = 200
+ATR_LEN = 5
+COOLDOWN_BARS = 6  # 對應 Pine Script 的 can_show_signal (6根K線)
+
 # ==========================================
-# 2. 策略計算函式
+# 2. 指標計算邏輯 (核心演算法)
 # ==========================================
-def calculate_magic_trend_and_buffers(df):
-    # (此區段邏輯保持不變，計算 MagicTrend 與 Buffer)
-    df['cci_200'] = ta.cci(df['high'], df['low'], df['close'], length=200)
-    df['atr_5'] = ta.atr(df['high'], df['low'], df['close'], length=5)
+def calculate_vidya(df, length=10, momentum=20):
+    """計算 VIDYA 指標"""
+    src = df['close']
+    mom = src.diff()
+    
+    # 計算 CMO
+    # Pine: sum_pos = math.sum((momentum >= 0) ? momentum : 0.0, vidya_momentum)
+    pos_mom = mom.where(mom >= 0, 0).rolling(momentum).sum()
+    neg_mom = (-mom.where(mom < 0, 0)).rolling(momentum).sum()
+    
+    denominator = pos_mom + neg_mom
+    cmo = (100 * (pos_mom - neg_mom) / denominator.replace(0, 1)).abs()
+    
+    # 計算 VIDYA (遞迴計算)
+    alpha = 2 / (length + 1)
+    vidya = np.zeros_like(src)
+    vidya[:] = np.nan
+    
+    # 初始化第一個非 NaN 的值
+    start_idx = momentum 
+    if start_idx < len(src):
+        vidya[start_idx] = src.iloc[start_idx]
+
+    src_values = src.values
+    cmo_values = cmo.values
+    
+    for i in range(start_idx + 1, len(df)):
+        val_alpha = (alpha * cmo_values[i] / 100)
+        # Pine: vidya_value := alpha * abs_cmo / 100 * src + (1 - alpha * abs_cmo / 100) * nz(vidya_value[1])
+        prev_vidya = vidya[i-1] if not np.isnan(vidya[i-1]) else src_values[i]
+        vidya[i] = val_alpha * src_values[i] + (1 - val_alpha) * prev_vidya
+        
+    # 最後做一次 SMA 平滑
+    # Pine: ta.sma(vidya_value, 15)
+    return ta.sma(pd.Series(vidya), length=15)
+
+def process_data(df):
+    """計算所有需要的指標並產生訊號"""
+    if len(df) < 250: return None
+    
+    # ---------------------------
+    # 基礎指標
+    # ---------------------------
+    df['ema7'] = ta.ema(df['close'], length=7)
+    df['ema21'] = ta.ema(df['close'], length=21)
+    df['ema200'] = ta.ema(df['close'], length=200)
+    df['atr_200'] = ta.atr(df['high'], df['low'], df['close'], length=200)
     df['tr'] = ta.true_range(df['high'], df['low'], df['close'])
-    df['cci_20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     
-    buffer_up = [0.0] * len(df)
-    buffer_dn = [0.0] * len(df)
-    x = [0.0] * len(df)
+    # ---------------------------
+    # VIDYA & Trend Up
+    # ---------------------------
+    df['vidya_sma'] = calculate_vidya(df, VIDYA_LEN, VIDYA_MOM)
+    df['upper_band'] = df['vidya_sma'] + df['atr_200'] * 2
+    df['lower_band'] = df['vidya_sma'] - df['atr_200'] * 2
     
-    multiplier = 1.0
-    sma_tr_5 = ta.sma(df['tr'], length=5) * multiplier
+    # 計算 is_trend_up (狀態機)
+    is_trend_up = np.full(len(df), False)
+    close_vals = df['close'].values
+    u_band = df['upper_band'].values
+    l_band = df['lower_band'].values
+    
+    for i in range(1, len(df)):
+        if np.isnan(u_band[i]): 
+            is_trend_up[i] = is_trend_up[i-1]
+            continue
+            
+        if close_vals[i] > u_band[i]:
+            is_trend_up[i] = True
+        elif close_vals[i] < l_band[i]:
+            is_trend_up[i] = False
+        else:
+            is_trend_up[i] = is_trend_up[i-1]
+            
+    df['is_trend_up'] = is_trend_up
+
+    # ---------------------------
+    # Magic Trend & Buffers (X line)
+    # ---------------------------
+    # 計算 ATR for Buffer
+    sma_tr_5 = ta.sma(df['tr'], length=ATR_LEN)
+    df['cci_200'] = ta.cci(df['high'], df['low'], df['close'], length=CCI_LEN)
+    df['cci_20'] = ta.cci(df['high'], df['low'], df['close'], length=20) # 小週期用
+    
+    # 初始化陣列
+    buffer_up = np.zeros(len(df))
+    buffer_dn = np.zeros(len(df))
+    x_line = np.zeros(len(df))
+    magic_trend = np.zeros(len(df))
     
     highs = df['high'].values
     lows = df['low'].values
     cci_200 = df['cci_200'].values
-    sma_tr = sma_tr_5.values
+    atr_vals = sma_tr_5.values
+    cci_20 = df['cci_20'].values
     
-    buffer_dn[0] = highs[0] + (sma_tr[0] if not np.isnan(sma_tr[0]) else 0)
-    buffer_up[0] = lows[0] - (sma_tr[0] if not np.isnan(sma_tr[0]) else 0)
-    
+    # 迭代計算 Buffer (X Line) 與 Magic Trend
+    # 這種遞迴計算無法向量化，必須跑迴圈
     for i in range(1, len(df)):
-        curr_atr = sma_tr[i] if not np.isnan(sma_tr[i]) else 0
+        curr_atr = atr_vals[i] if not np.isnan(atr_vals[i]) else 0
+        
+        # --- Buffer Logic ---
         b_dn = highs[i] + curr_atr
         b_up = lows[i] - curr_atr
+        
         prev_cci = cci_200[i-1]
         curr_cci = cci_200[i]
         
+        # CCI 穿越邏輯
         if curr_cci >= 0 and prev_cci < 0: b_up = buffer_dn[i-1]
         if curr_cci <= 0 and prev_cci > 0: b_dn = buffer_up[i-1]
-            
+        
+        # 平滑邏輯
         if curr_cci >= 0:
             if b_up < buffer_up[i-1]: b_up = buffer_up[i-1]
-        else:
-            if curr_cci <= 0:
-                if b_dn > buffer_dn[i-1]: b_dn = buffer_dn[i-1]
-        
+        else: # curr_cci <= 0
+            if b_dn > buffer_dn[i-1]: b_dn = buffer_dn[i-1]
+            
         buffer_up[i] = b_up
         buffer_dn[i] = b_dn
         
-        if curr_cci >= 0: x[i] = b_up
-        elif curr_cci <= 0: x[i] = b_dn
-        else: x[i] = x[i-1]
-            
-    df['x'] = x
-
-    magic_trend = [0.0] * len(df)
-    atrs_5 = ta.sma(df['tr'], length=5).values
-    coeff = 1.0
-    cci_20 = df['cci_20'].values
-    
-    for i in range(1, len(df)):
-        curr_atr = atrs_5[i] if not np.isnan(atrs_5[i]) else 0
-        up_t = lows[i] - curr_atr * coeff
-        down_t = highs[i] + curr_atr * coeff
+        # 計算 X
+        if curr_cci >= 0: x_line[i] = b_up
+        elif curr_cci <= 0: x_line[i] = b_dn
+        else: x_line[i] = x_line[i-1]
+        
+        # --- Magic Trend Logic (Small Period) ---
+        up_t = lows[i] - curr_atr
+        down_t = highs[i] + curr_atr
         prev_magic = magic_trend[i-1]
         
         if cci_20[i] >= 0:
@@ -84,198 +166,214 @@ def calculate_magic_trend_and_buffers(df):
         else:
             if down_t > prev_magic: magic_trend[i] = prev_magic
             else: magic_trend[i] = down_t
-                
+            
+    df['x'] = x_line
     df['magic_trend'] = magic_trend
-    return df
-
-def check_signal(df, symbol, interval):
-    # 增加回傳值數量，改為回傳 side, entry, sl, tp1, tp2, tp3
-    if len(df) < 250: return None, 0, 0, 0, 0, 0
     
-    df['atr_200'] = ta.atr(df['high'], df['low'], df['close'], length=200)
-    df['ema7'] = ta.ema(df['close'], length=7)
-    df['ema21'] = ta.ema(df['close'], length=21)
-    df['ema200'] = ta.ema(df['close'], length=200)
-    
-    vidya_length, vidya_mom = 10, 20
-    mom = df['close'].diff()
-    pos_mom = mom.where(mom >= 0, 0).rolling(vidya_mom).sum()
-    neg_mom = (-mom.where(mom < 0, 0)).rolling(vidya_mom).sum()
-    denominator = pos_mom + neg_mom
-    cmo = (100 * (pos_mom - neg_mom) / denominator.replace(0, 1)).abs()
-    
-    alpha = 2 / (vidya_length + 1)
-    vidya = [df['close'].iloc[0]] * len(df)
-    cmo_vals = cmo.values
-    close_vals = df['close'].values
-    
-    for i in range(1, len(df)):
-        v_alpha = (alpha * cmo_vals[i] / 100) if not np.isnan(cmo_vals[i]) else 0
-        vidya[i] = v_alpha * close_vals[i] + (1 - v_alpha) * vidya[i-1]
-    df['vidya_sma'] = ta.sma(pd.Series(vidya), length=15)
-    
-    upper_band = df['vidya_sma'] + df['atr_200'] * 2
-    lower_band = df['vidya_sma'] - df['atr_200'] * 2
-    
-    is_trend_up = [False] * len(df)
-    u_band = upper_band.values
-    l_band = lower_band.values
-    
-    for i in range(1, len(df)):
-        if close_vals[i] > u_band[i]: is_trend_up[i] = True
-        elif close_vals[i] < l_band[i]: is_trend_up[i] = False
-        else: is_trend_up[i] = is_trend_up[i-1]
-    df['is_trend_up'] = is_trend_up
-    
-    df = calculate_magic_trend_and_buffers(df)
-    
+    # ---------------------------
+    # 訊號判斷
+    # ---------------------------
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     
+    # 定義 Crossovers
+    # Python 的 crossover: 前一根 <= 線 且 當前 > 線
     cross_over_x = (prev['close'] <= prev['x']) and (curr['close'] > curr['x'])
     cross_under_x = (prev['close'] >= prev['x']) and (curr['close'] < curr['x'])
+    
     cross_over_magic = (prev['close'] <= prev['magic_trend']) and (curr['close'] > curr['magic_trend'])
     cross_under_magic = (prev['close'] >= prev['magic_trend']) and (curr['close'] < curr['magic_trend'])
+    
     cross_over_ema200 = (prev['close'] <= prev['ema200']) and (curr['close'] > curr['ema200'])
     cross_under_ema200 = (prev['close'] >= prev['ema200']) and (curr['close'] < curr['ema200'])
 
     sorignal = curr['cci_20'] >= 0
     bigmagicTrend = curr['cci_200'] >= 0
     
-    original_long = (curr['is_trend_up'] and cross_over_x and cross_over_magic and curr['close'] > curr['ema200'] and curr['close'] > curr['ema7'] and curr['ema7'] > curr['ema21'])
-    original_short = (not curr['is_trend_up'] and cross_under_x and cross_under_magic and curr['close'] < curr['ema200'] and curr['close'] < curr['ema7'] and curr['ema7'] < curr['ema21'])
-    cross200_long = (sorignal and bigmagicTrend and curr['close'] > curr['ema7'] and curr['close'] > curr['ema21'] and cross_over_ema200)
-    cross200_short = (not sorignal and not bigmagicTrend and curr['close'] < curr['ema7'] and curr['close'] < curr['ema21'] and cross_under_ema200)
+    # 邏輯條件 (參考 Pine Script)
+    # 1. Original Strategy
+    original_long = (
+        curr['is_trend_up'] and 
+        cross_over_x and 
+        cross_over_magic and 
+        curr['close'] > curr['ema200'] and 
+        curr['close'] > curr['ema7'] and 
+        curr['ema7'] > curr['ema21']
+    )
+    
+    original_short = (
+        not curr['is_trend_up'] and 
+        cross_under_x and 
+        cross_under_magic and 
+        curr['close'] < curr['ema200'] and 
+        curr['close'] < curr['ema7'] and 
+        curr['ema7'] < curr['ema21']
+    )
+    
+    # 2. Cross 200 Strategy
+    cross200_long = (
+        sorignal and 
+        bigmagicTrend and 
+        curr['close'] > curr['ema7'] and 
+        curr['close'] > curr['ema21'] and 
+        cross_over_ema200
+    )
+    
+    cross200_short = (
+        not sorignal and 
+        not bigmagicTrend and 
+        curr['close'] < curr['ema7'] and 
+        curr['close'] < curr['ema21'] and 
+        cross_under_ema200
+    )
 
     side = None
-    sl, tp1, tp2, tp3 = 0, 0, 0, 0
-    
-    rma_tr = ta.rma(df['tr'], length=14).iloc[-1]
-    tp1_dist = rma_tr * 2.55
-    tp2_dist = rma_tr * 5.1
-    tp3_dist = rma_tr * 7.65 # 增加 TP3 距離計算
-    
     if original_long or cross200_long:
         side = "LONG"
-        sl = curr['low'] - tp1_dist
-        tp1 = curr['high'] + tp1_dist
-        tp2 = curr['high'] + tp2_dist
-        tp3 = curr['high'] + tp3_dist
-        
     elif original_short or cross200_short:
         side = "SHORT"
-        sl = curr['high'] + tp1_dist
-        tp1 = curr['low'] - tp1_dist
-        tp2 = curr['low'] - tp2_dist
-        tp3 = curr['low'] - tp3_dist
-
-    # 分別回傳數值，方便 Notify 格式化
-    return side, curr['close'], sl, tp1, tp2, tp3
+        
+    return side, df
 
 # ==========================================
-# 3. 系統核心
+# 3. 機器人主程式
 # ==========================================
 class TradingBot:
     def __init__(self):
-        self.sent_signals = {}
+        # 記錄每個幣種+週期的最後訊號時間 (timestamp)
+        self.last_signals = {} 
         self.symbols = []
         self.last_update = datetime.min
 
     def update_top_symbols(self):
-        """自動獲取 Bybit 交易量前 10 名的 USDT 幣對 (排除穩定幣)"""
+        """獲取熱門幣種"""
         if datetime.now() - self.last_update > timedelta(hours=4):
             try:
-                tickers = EXCHANGE.fetch_tickers()
-                exclude_list = ['USDC', 'DAI', 'FDUSD', 'USDE', 'TUSD', 'EUR', 'BUSD', 'UP', 'DOWN', 'BEAR', 'BULL', '3S', '3L']
-                
+                tickers = exchange.fetch_tickers()
                 valid_tickers = []
+                exclude = ['USDC', 'DAI', 'FDUSD', 'USDE', 'BUSD']
                 for s, t in tickers.items():
-                    if '/USDT' in s and not any(ex in s for ex in exclude_list):
+                    if '/USDT' in s and not any(ex in s for ex in exclude):
                         vol = t['quoteVolume'] if t.get('quoteVolume') else 0
                         valid_tickers.append({'symbol': s, 'vol': vol})
-
-                sorted_list = sorted(valid_tickers, key=lambda x: x['vol'], reverse=True)
-                self.symbols = [x['symbol'] for x in sorted_list[:10]]
+                
+                # 取成交量前 10
+                self.symbols = [x['symbol'] for x in sorted(valid_tickers, key=lambda x: x['vol'], reverse=True)[:10]]
                 self.last_update = datetime.now()
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔥 熱門幣種更新: {self.symbols}")
+                print(f"[{datetime.now().strftime('%H:%M')}] 更新監控清單: {self.symbols}")
             except Exception as e:
-                print(f"更新排名失敗: {e}")
-                if not self.symbols: self.symbols = ['BTC/USDT', 'ETH/USDT']
+                print(f"更新清單失敗: {e}")
+                if not self.symbols: self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
         return self.symbols
 
-    def fetch_and_run(self, symbol):
-        try:
-            bars = EXCHANGE.fetch_ohlcv(symbol, timeframe='15m', limit=1000)
-            df = pd.DataFrame(bars, columns=['timestamp','open','high','low','close','volume'])
-            df = df.astype(float)
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    def calculate_sl_tp(self, df, side):
+        """計算止盈止損 (依照 Pine Script RMA 邏輯)"""
+        curr = df.iloc[-1]
+        
+        # Pine: ma_function(ta.tr(true), length) * m1
+        # Python pandas_ta 的 rma 預設即為 Pine 的 rma
+        rma_tr = ta.rma(df['tr'], length=14).iloc[-1]
+        
+        m_tp1 = 2.55
+        m_tp2 = 5.1
+        m_tp3 = 7.65
+        
+        entry = curr['close']
+        
+        if side == "LONG":
+            sl = curr['low'] - (rma_tr * m_tp1) # Pine 中 SL 參考的是 x2 (用 m 計算的距離)
+            tp1 = curr['high'] + (rma_tr * m_tp1)
+            tp2 = curr['high'] + (rma_tr * m_tp2)
+            tp3 = curr['high'] + (rma_tr * m_tp3)
+        else: # SHORT
+            sl = curr['high'] + (rma_tr * m_tp1)
+            tp1 = curr['low'] - (rma_tr * m_tp1)
+            tp2 = curr['low'] - (rma_tr * m_tp2)
+            tp3 = curr['low'] - (rma_tr * m_tp3)
+            
+        return entry, sl, tp1, tp2, tp3
 
-            data_map = {
-                "15M": df,
-                "30M": df.resample('30min', on='timestamp').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna().reset_index(),
-                "1H": df.resample('1h', on='timestamp').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna().reset_index()
-            }
-
-            for interval, d in data_map.items():
+    def run_analysis(self):
+        symbols = self.update_top_symbols()
+        timeframes = ['15m', '30m', '1h'] # 需要監控的週期
+        
+        for symbol in symbols:
+            for tf in timeframes:
                 try:
-                    # 接收 6 個回傳值
-                    side, price, sl, tp1, tp2, tp3 = check_signal(d, symbol, interval)
+                    # 直接獲取該週期的數據 (更精準，不使用 resample)
+                    limit = 500 # 足夠計算 EMA200
+                    bars = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+                    df = pd.DataFrame(bars, columns=['timestamp','open','high','low','close','volume'])
+                    df = df.astype(float)
+                    
+                    side, df_result = process_data(df)
+                    
                     if side:
-                        self.notify(symbol, side, interval, price, sl, tp1, tp2, tp3)
-                except Exception as inner:
-                    print(f"計算 {symbol} {interval} 錯誤: {inner}")
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"抓取 {symbol} 失敗: {e}")
+                        # 檢查冷卻時間 (Pine: bar_index - last_signal_bar > 6)
+                        # 這裡我們用時間判斷，簡單起見設為該週期的 6 倍時間
+                        signal_key = f"{symbol}_{tf}_{side}"
+                        last_time = self.last_signals.get(signal_key, 0)
+                        
+                        # 轉換當前K線時間戳
+                        current_ts = df['timestamp'].iloc[-1]
+                        
+                        # 如果是新訊號 (時間戳不同 且 距離上次足夠久)
+                        # 這裡簡化邏輯：只要這根K線還沒發過通知就可以
+                        # 若要嚴格模擬 bar_index > 6，則比較複雜，這邊採用「不重複通知同一根K線」
+                        if current_ts != last_time:
+                            entry, sl, tp1, tp2, tp3 = self.calculate_sl_tp(df_result, side)
+                            self.send_discord(symbol, side, tf, entry, sl, tp1, tp2, tp3)
+                            self.last_signals[signal_key] = current_ts # 更新最後發訊號的K線時間
+                            
+                    time.sleep(0.2) # 避免 API Rate Limit
+                    
+                except Exception as e:
+                    print(f"分析錯誤 {symbol} {tf}: {e}")
 
-    def notify(self, symbol, side, interval, entry, sl, tp1, tp2, tp3):
-        key = (symbol, side, interval)
-        if key in self.sent_signals and (datetime.now() - self.sent_signals[key] < timedelta(hours=COOL_DOWN_HOURS)):
-            return
+  # ==========================================
+    # 4. 修改後的通知格式 (符合圖片)
+    # ==========================================
+    def send_discord(self, symbol, side, interval, entry, sl, tp1, tp2, tp3):
+        # 取得台灣時間
+        tw_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%H:%M')
         
-        print(f"🚀 訊號觸發: {symbol} {side} ({interval})")
+        # 處理方向文字
+        side_cn = "做多" if side == "LONG" else "做空"
         
-        # 計算台灣時間 (UTC+8)
-        tw_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+        # 處理標題顯示 (如果你想顯示 COINGLASS 可以在這裡改)
+        exchange_name = "BYBIT" # 或是寫 "BIGGET", "COINGLASS"
         
-        # 中文方向
-        side_cn = "多" if side == "LONG" else "空"
+        # 格式化數字 (保留4位小數，若數字過小可動態調整)
+        def fmt(num): return f"{num:.4f}".rstrip('0').rstrip('.')
         
-        # 組合純文字訊息 (符合你的圖片格式)
-        message_content = (
+        # 組合純文字訊息
+        msg = (
             f"🚨\n"
-            f"{symbol} 訊號 BYBIT\n"
+            f"{symbol} 訊號 {exchange_name}\n"
             f"方向 {side_cn}\n"
-            f"週期: {interval}\n"
-            f"進場: {entry:.4f}\n"
-            f"SL: {sl:.4f}\n"
-            f"TP1: {tp1:.4f}\n"
-            f"TP2: {tp2:.4f}\n"
-            f"TP3: {tp3:.4f}\n"
-            f"偵測時間: {tw_time}"
+            f"週期:{interval.upper()}\n"
+            f"進場:{fmt(entry)}\n"
+            f"SL:{fmt(sl)}\n"
+            f"TP1: {fmt(tp1)}\n"
+            f"TP2: {fmt(tp2)}\n"
+            f"TP3: {fmt(tp3)}\n"
+            f"偵測時間: 台灣時間 {tw_time}"
         )
-
-        payload = {
-            "content": message_content
-        }
+        
+        payload = {"content": msg}
         
         try:
-            requests.post(DISCORD_URL, json=payload, timeout=10)
-            self.sent_signals[key] = datetime.now()
-        except: pass
+            requests.post(DISCORD_URL, json=payload)
+            print(f"已發送: {symbol} {side}")
+        except Exception as e:
+            print(f"Discord 失敗: {e}")
 
 if __name__ == "__main__":
     bot = TradingBot()
-    print("Bot 啟動中...")
-    # 測試訊息，確認格式
-    bot.notify("SYSTEM", "LONG", "TEST", 0, 0, 0, 0, 0)
+    print("🚀 Zeabur Trading Bot (格式修正版) 已啟動...")
+    # 測試發送一則訊息確認格式
+    bot.send_discord("TEST/USDT", "LONG", "15m", 100.5, 99.0, 102.0, 104.0, 106.0)
     
     while True:
-        try:
-            current_symbols = bot.update_top_symbols()
-            for s in current_symbols:
-                bot.fetch_and_run(s)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 輪詢完成")
-        except Exception as e:
-            print(f"主循環異常: {e}")
-        time.sleep(300)
+        bot.run_analysis()
+        time.sleep(60)
