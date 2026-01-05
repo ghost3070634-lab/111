@@ -12,17 +12,20 @@ from datetime import datetime, timedelta
 DISCORD_URL = "https://discord.com/api/webhooks/1457246379242950797/LB6npSWu5J9ZbB8NYp90N-gpmDrjOK2qPqtkaB5AP6YztzdfzmBF6oxesKJybWQ04xoU"
 COOL_DOWN_HOURS = 0.25 
 
-# 將導遊換成 Bybit，避開幣安對美國伺服器的封鎖
+# 將導遊換成 Bybit
 EXCHANGE = ccxt.bybit({
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'} 
 })
 
 # ==========================================
-# 2. 策略計算函式 (保持 TheConcept 邏輯)
+# 2. 策略計算函式
 # ==========================================
 def check_signal(df, symbol, interval):
-    if len(df) < 200: return None, 0, 0, ""
+    # 檢查 K 棒數量是否足夠計算 EMA200
+    if len(df) < 200: 
+        # print(f"{symbol} {interval} 資料不足: 只有 {len(df)} 根 (需要 200+)")
+        return None, 0, 0, ""
     
     # 指標計算
     df['tr'] = ta.true_range(df['high'], df['low'], df['close'])
@@ -31,17 +34,30 @@ def check_signal(df, symbol, interval):
     df['ema21'] = ta.ema(df['close'], length=21)
     df['ema200'] = ta.ema(df['close'], length=200)
     
+    # VIDYA 計算
     vidya_length, vidya_mom = 10, 20
     mom = df['close'].diff()
     pos_mom = mom.where(mom >= 0, 0).rolling(vidya_mom).sum()
     neg_mom = (-mom.where(mom < 0, 0)).rolling(vidya_mom).sum()
-    cmo = (100 * (pos_mom - neg_mom) / (pos_mom + neg_mom)).abs()
+    
+    # 避免除以零
+    denominator = pos_mom + neg_mom
+    cmo = (100 * (pos_mom - neg_mom) / denominator.replace(0, 1)).abs()
+    
     alpha = 2 / (vidya_length + 1)
     
     vidya = [0.0] * len(df)
+    # 簡單初始化第一個值
+    vidya[0] = df['close'].iloc[0] 
+    
+    cmo_values = cmo.values
+    close_values = df['close'].values
+    
+    # 優化迴圈計算
     for i in range(1, len(df)):
-        v_alpha = (alpha * cmo.iloc[i] / 100) if not np.isnan(cmo.iloc[i]) else 0
-        vidya[i] = v_alpha * df['close'].iloc[i] + (1 - v_alpha) * vidya[i-1]
+        v_alpha = (alpha * cmo_values[i] / 100) if not np.isnan(cmo_values[i]) else 0
+        vidya[i] = v_alpha * close_values[i] + (1 - v_alpha) * vidya[i-1]
+        
     df['vidya'] = pd.Series(vidya, index=df.index)
     df['vidya_sma'] = ta.sma(df['vidya'], length=15)
     
@@ -50,18 +66,34 @@ def check_signal(df, symbol, interval):
     lower_band = df['vidya_sma'] - df['atr_200'] * band_dist
     
     is_trend_up = [False] * len(df)
+    close_list = df['close'].values
+    upper_list = upper_band.values
+    lower_list = lower_band.values
+    
     for i in range(1, len(df)):
-        if df['close'].iloc[i] > upper_band.iloc[i]: is_trend_up[i] = True
-        elif df['close'].iloc[i] < lower_band.iloc[i]: is_trend_up[i] = False
+        if close_list[i] > upper_list[i]: is_trend_up[i] = True
+        elif close_list[i] < lower_list[i]: is_trend_up[i] = False
         else: is_trend_up[i] = is_trend_up[i-1]
     df['is_trend_up'] = is_trend_up
-    this_cci_20 = ta.cci(df['close'], length=20)
+    
+    # =========== 修正重點 ===========
+    # CCI 需要 High, Low, Close 三個參數
+    this_cci_20 = ta.cci(df['high'], df['low'], df['close'], length=20)
+    # ===============================
     
     rma_tr = ta.rma(df['tr'], length=14)
+    # 確保 rma_tr 不是空的
+    if rma_tr is None or pd.isna(rma_tr.iloc[-1]):
+        return None, 0, 0, ""
+
     tp1_dist = rma_tr.iloc[-1] * 2.55
     
     curr = df.iloc[-1]
     side, entry, sl, tp_str = None, curr['close'], 0, ""
+
+    # 確保指標都有值 (避免 NaN 導致錯誤)
+    if pd.isna(curr['ema200']) or pd.isna(this_cci_20.iloc[-1]):
+        return None, 0, 0, ""
 
     if curr['is_trend_up'] and curr['close'] > curr['ema200'] and curr['ema7'] > curr['ema21'] and this_cci_20.iloc[-1] >= 0:
         side = "LONG"
@@ -104,7 +136,11 @@ class TradingBot:
 
     def fetch_and_run(self, symbol):
         try:
-            bars = EXCHANGE.fetch_ohlcv(symbol, timeframe='15m', limit=300)
+            # =========== 修正重點 ===========
+            # limit 改為 1000，確保 resample 到 1H 後還有 >200 根 K 棒
+            bars = EXCHANGE.fetch_ohlcv(symbol, timeframe='15m', limit=1000)
+            # ===============================
+            
             df = pd.DataFrame(bars, columns=['timestamp','open','high','low','close','volume'])
             df = df.astype(float)
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -116,10 +152,14 @@ class TradingBot:
             }
 
             for interval, d in data_map.items():
-                side, price, sl, tp = check_signal(d, symbol, interval)
-                if side:
-                    self.notify(symbol, side, interval, price, sl, tp)
-            time.sleep(1) 
+                try:
+                    side, price, sl, tp = check_signal(d, symbol, interval)
+                    if side:
+                        self.notify(symbol, side, interval, price, sl, tp)
+                except Exception as inner_e:
+                    print(f"計算 {symbol} {interval} 時發生錯誤: {inner_e}")
+            
+            time.sleep(0.5) # 稍微降速避免被 Bybit ban
         except Exception as e:
             print(f"抓取 {symbol} 失敗: {e}")
 
@@ -127,6 +167,8 @@ class TradingBot:
         key = (symbol, side, interval)
         if key in self.sent_signals and (datetime.now() - self.sent_signals[key] < timedelta(hours=COOL_DOWN_HOURS)):
             return
+        
+        print(f"發送訊號: {symbol} {side} {interval}")
         
         payload = {
             "embeds": [{
@@ -150,6 +192,7 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot()
     # 啟動測試
+    print("Bot 啟動中...")
     bot.notify("SYSTEM", "LONG", "START", 0, 0, "Bybit 監控機器人已啟動")
     
     while True:
