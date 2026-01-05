@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 # 1. 配置設定
 # ==========================================
 # 優先讀取 Zeabur 環境變數，如果沒有則使用預設值
-DISCORD_URL = os.getenv("https://discord.com/api/webhooks/1457246379242950797/LB6npSWu5J9ZbB8NYp90N-gpmDrjOK2qPqtkaB5AP6YztzdfzmBF6oxesKJybWQ04xoU")
+DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1457246379242950797/LB6npSWu5J9ZbB8NYp90N-gpmDrjOK2qPqtkaB5AP6YztzdfzmBF6oxesKJybWQ04xoU")
 
 # 交易所設定 (不需 API Key，只需讀取公開數據)
 exchange = ccxt.bybit({
@@ -358,3 +358,4 @@ if __name__ == "__main__":
     while True:
         bot.run_analysis()
         time.sleep(60)
+
