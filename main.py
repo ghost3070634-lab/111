@@ -259,7 +259,7 @@ class TradingBot:
                             vol = t['quoteVolume'] if t.get('quoteVolume') else 0
                             valid_tickers.append({'symbol': s, 'vol': vol})
                             
-                self.symbols = [x['symbol'] for x in sorted(valid_tickers, key=lambda x: x['vol'], reverse=True)[:50]
+                self.symbols = [x['symbol'] for x in sorted(valid_tickers, key=lambda x: x['vol'], reverse=True)[:50]]
                 self.last_update = datetime.now()
                 print(f"[{datetime.now().strftime('%H:%M')}] 更新監控: {self.symbols}")
             except: self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT' 'BNB/USDT', 'XRP/USDT']
